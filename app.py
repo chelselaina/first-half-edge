@@ -4,7 +4,7 @@ import io
 import os
 import pandas as pd
 import streamlit as st
-from agent.feeds import get_live_h1_odds
+from agent.feeds import get_live_h1_odds, get_history
 from agent.model import train,scan
 from agent.demo import create_demo
 
@@ -20,13 +20,37 @@ with st.sidebar:
         st.session_state.games=games
         st.session_state.lines=lines
         st.session_state.demo=True
-        st.session_state.pop('trained',None)
+        for old_key in ('trained','outputs','unmatched'):
+            st.session_state.pop(old_key,None)
+    st.markdown('### Real NCAA game history')
+    st.caption('Free public SportsDataverse results; downloads historical games with verified halftime scores. Available release dates can lag the current season.')
+    hist_seasons=st.multiselect('Historical seasons (ending year)',[2023,2024,2025,2026,2027],default=[2024,2025,2026],help='The 2026 season means 2025–26. The 2027 release may be delayed or not yet contain current games.')
+    if st.button('Fetch REAL NCAA halftime history',disabled=not hist_seasons,use_container_width=True):
+        try:
+            with st.spinner('Downloading and checking season files; this may take a while…'):
+                years=sorted(hist_seasons)
+                new_games=get_history(years, '/tmp/first_half_edge_real_history.csv')
+            st.session_state.games=new_games
+            st.session_state.demo=False
+            st.session_state.history_source='SportsDataverse verified first-half scores'
+            for old_key in ('trained','lines','outputs','unmatched'):
+                st.session_state.pop(old_key,None)
+            st.success(f'Loaded {len(new_games):,} actual completed games. Latest score date: {new_games.game_date.max()}')
+        except Exception as exc:
+            st.error(f'Real-history import failed. No results were substituted. Details: {exc}')
+    if 'games' in st.session_state and not st.session_state.get('demo',True):
+        g=st.session_state.games
+        st.caption(f'Actual games loaded: {len(g):,} · Most recent: {g.game_date.max()}')
+        st.download_button('Save real history CSV',g.to_csv(index=False),file_name='first_half_real_history.csv',mime='text/csv',use_container_width=True)
+        if str(g.game_date.max()) < '2026-11-01':
+            st.warning('This history does not include recent 2026–27 games. Do not treat any new-season estimates as current or reliable.')
     hist_file=st.file_uploader('Historical games CSV',type='csv',key='game_upload')
     if hist_file is not None:
         if st.button('Use uploaded game history', use_container_width=True):
             st.session_state.games=pd.read_csv(hist_file)
             st.session_state.demo=False
-            st.session_state.pop('trained',None)
+            for old_key in ('trained','lines','outputs','unmatched'):
+                st.session_state.pop(old_key,None)
     lines_file=st.file_uploader('Current first-half spreads CSV',type='csv',key='odds_upload')
     if lines_file is not None and st.button('Use uploaded lines',use_container_width=True):
         st.session_state.lines=pd.read_csv(lines_file)
