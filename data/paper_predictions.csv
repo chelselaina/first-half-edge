@@ -1,0 +1,1 @@
+event_id,game_date,tip_utc,forecast_utc,model_version,provider_home,provider_away,matched_home,matched_away,home_games,away_games,match_confidence,projected_home_h1,projected_away_h1,predicted_home_margin,status,actual_home_h1,actual_away_h1,actual_home_margin,absolute_error,baseline_absolute_error,graded_utc
