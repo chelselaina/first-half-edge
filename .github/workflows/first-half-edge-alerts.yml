@@ -7,8 +7,8 @@ on:
       timezone: 'America/New_York'
 
 permissions:
-  contents: write
-  issues: write
+  contents: write  # save a forward-only paper research ledger
+  issues: write    # existing public research-only Issue alerts
 
 concurrency:
   group: first-half-edge-research
@@ -28,6 +28,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Verify paper ledger logic (no API credits)
+        run: python -m agent.performance --self-test
+
+      # IMPORTANT: capture forecasts before the sportsbook scanner.
+      # No sportsbook odds are required to freeze an eligible pre-tip prediction.
+      - name: Freeze pregame predictions and grade completed games
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python -m agent.performance
+
       - name: Check upcoming games and fresh first-half lines
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -36,25 +46,33 @@ jobs:
           SCAN_OUTPUT: run_artifacts/quotes.csv
         run: python -m agent.auto_alert
 
-      - name: Freeze and grade paper forecasts
+      # Persist any first-half quotes captured by the odds scanner.
+      # Run even if the odds call failed: frozen predictions still matter.
+      - name: Attach paper price-gap watches
+        if: always()
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SCAN_OUTPUT: run_artifacts/quotes.csv
-        run: python -m agent.performance
+        run: python -m agent.performance --quotes-only
 
-      - name: Preserve paper ledgers in repository
+      - name: Preserve paper ledgers
+        if: always()
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/paper_predictions.csv data/paper_watch_candidates.csv
+          for file in data/paper_predictions.csv data/paper_watch_candidates.csv; do
+            if test -f "$file"; then
+              git add "$file"
+            fi
+          done
           if ! git diff --cached --quiet; then
             git commit -m "Save pregame paper forecasts and grades [skip ci]"
             git push origin HEAD:main
           else
-            echo "No new records or results to save."
+            echo "No new paper records to save."
           fi
 
-      - name: Save scan artifacts
+      - name: Preserve troubleshooting artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
