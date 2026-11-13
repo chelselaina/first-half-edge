@@ -34,6 +34,7 @@ def _period_points(blob: Any) -> list[int]:
         parts = list(blob)
     else:
         raw = str(blob).strip()
+        raw = re.sub(r'(?<=\})\s*(?=\{)', ', ', raw)
         if not raw or raw.lower() in {'nan', 'null', 'none', '[]'}:
             return []
         parts = None
