@@ -11,6 +11,7 @@ These files become PUBLIC when committed to a public GitHub repository.
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 import os
 from datetime import datetime, timezone
@@ -23,7 +24,22 @@ from agent.feeds import get_history
 from agent.slate import analyze_slate, fetch_upcoming_events
 
 ET = ZoneInfo('America/New_York')
-MODEL_VERSION = 'current_season_matchup_v03'  # descriptive label for existing estimator
+def _model_fingerprint() -> str:
+    """Record the actual estimator source version, not a manually maintained label.
+
+    The paper-ledger itself can change without making past projections look as
+    though they came from a new statistical estimator.
+    """
+    content = b''
+    for relative in ('agent/matchups.py', 'agent/slate.py'):
+        source = Path(relative)
+        if not source.exists():
+            return 'unknown_current_season_model'
+        content += relative.encode('utf-8') + b'\0' + source.read_bytes()
+    return 'season_model_' + hashlib.sha256(content).hexdigest()[:12]
+
+
+MODEL_VERSION = _model_fingerprint()
 PRED_FIELDS = [
     'event_id', 'game_date', 'tip_utc', 'forecast_utc', 'model_version',
     'provider_home', 'provider_away', 'matched_home', 'matched_away',
@@ -309,7 +325,61 @@ def report(predictions: pd.DataFrame, watches: pd.DataFrame) -> str:
     return msg
 
 
-def run():
+def tracker_self_test() -> str:
+    """Tiny deterministic integrity test without network, keys, or real wagers.
+
+    Fails the scheduled run if core ledger functions can't freeze, preserve,
+    and grade a forecast with the correct winning/losing spread orientation.
+    """
+    from tempfile import TemporaryDirectory
+
+    before = datetime.fromisoformat('2026-11-13T15:00:00+00:00')
+    later = datetime.fromisoformat('2026-11-13T22:00:00+00:00')
+    event = 'SELFTEST_EVENT_NEVER_REAL'
+    fixture = pd.DataFrame([dict(event_id=event,
+        commence_time='2026-11-13T20:00:00+00:00',
+        home_team='Example Home', away_team='Example Away')])
+    slate = pd.DataFrame([{'Event ID':event,
+        'Projected home margin':4.5, 'Home games':3,'Away games':4,
+        'Match confidence':1.0,'Matched home':'Example Home',
+        'Matched away':'Example Away','Home 1H projected':40,
+        'Away 1H projected':35.5}])
+    p = pd.DataFrame(columns=PRED_FIELDS)
+    p = snapshot_predictions(p, fixture, slate, now=before)
+    if len(p) != 1 or str(p.iloc[0]['status']) != 'PENDING':
+        raise AssertionError('Tracker cannot freeze pregame prediction')
+    p = snapshot_predictions(p, fixture, slate, now=before)
+    if len(p) != 1:
+        raise AssertionError('Tracker duplicated frozen prediction')
+    hist = pd.DataFrame([{'game_date':'2026-11-13',
+        'home_team':'Example Home','away_team':'Example Away',
+        'home_h1':42,'away_h1':36}])
+    p = grade_predictions(p, hist, now=later)
+    if (str(p.iloc[0]['status']) != 'GRADED'
+            or abs(float(p.iloc[0]['absolute_error']) - 1.5) > 1e-6):
+        raise AssertionError('Tracker grade or margin error is wrong')
+    # A wager on Example Home -3.5 wins when home leads by 6.
+    with TemporaryDirectory() as tmp:
+        price = Path(tmp) / 'quotes.csv'
+        pd.DataFrame([{'event_id':event,'game_date':'2026-11-13',
+            'selection':'Example Home','bookmaker':'Example Book',
+            'spread':-3.5,'american_odds':-110,'model_margin':4.5,
+            'point_gap':1.0,'status':'REVIEW POINT GAP — PAPER ONLY',
+            'checked_at_utc':'2026-11-13T15:01:00+00:00',
+            'quote_updated_utc':'2026-11-13T15:00:00+00:00'}]).to_csv(price,index=False)
+        w = snapshot_watch(pd.DataFrame(columns=WATCH_FIELDS),price,p)
+        w = grade_watches(w,p,now=later)
+        if (len(w) != 1 or str(w.iloc[0]['paper_result']) != 'WIN'
+                or abs(float(w.iloc[0]['paper_profit_units']) - 100/110) > 1e-4):
+            raise AssertionError('Tracker quote snapshot or 1H spread grading is wrong')
+        ledger = Path(tmp)/'predictions.csv'
+        _write_csv(ledger,p,PRED_FIELDS)
+        if len(_read_csv(ledger,PRED_FIELDS)) != 1:
+            raise AssertionError('Tracker failed to persist records')
+    return 'Tracker integrity test PASSED (fictional data only).'
+
+
+def run(*, quotes_only: bool = False):
     now=datetime.now(timezone.utc)
     local=now.astimezone(ET)
     season=local.year+1 if local.month>=7 else local.year
@@ -318,29 +388,84 @@ def run():
     watch_path=root/'paper_watch_candidates.csv'
     pred=_read_csv(pred_path,PRED_FIELDS)
     watch=_read_csv(watch_path,WATCH_FIELDS)
+    initial_pred=len(pred)
+    initial_graded=(pred['status']=='GRADED').sum() if not pred.empty else 0
     key=os.getenv('ODDS_API_KEY','').strip()
+    market_output=Path(os.getenv('SCAN_OUTPUT','run_artifacts/quotes.csv'))
+
+    if quotes_only:
+        # Attach sportsbook quotes without re-fetching the schedule or scores.
+        # This runs after the odds checker and must NOT change past predictions.
+        watch=snapshot_watch(watch, market_output, pred)
+        _write_csv(watch_path,watch,WATCH_FIELDS)
+        print('Quote attachment complete. Existing pregame forecasts not modified.')
+        report(pred,watch)
+        return
+
     if not key:
-        raise SystemExit('Missing ODDS_API_KEY: cannot query upcoming events')
+        raise SystemExit('Missing ODDS_API_KEY in GitHub Actions repository secrets')
     history=pd.DataFrame()
+    score_date='unavailable'
     try:
         history=get_history([season],'/tmp/fhe_paper_games.csv')
-    except Exception:
-        print('History feed unavailable. Existing predictions remain pending; no invented outcomes.')
-    # Grade previously frozen forecasts before capturing new ones.
+        if not history.empty:
+            score_date=str(history.game_date.max())
+    except Exception as e:
+        # Never print an exception message that might contain a URL/API key.
+        print(f'History feed unavailable ({type(e).__name__}). '
+              'Existing predictions remain pending; no invented outcomes.')
+    # Grade forecasts from previous days independently of the odds scanner.
     pred=grade_predictions(pred,history,now=now)
     watch=grade_watches(watch,pred,now=now)
+    fixtures_count=0
+    projections_count=0
+    eligible_count=0
     try:
         fixtures=fetch_upcoming_events(local.date().isoformat(),key,now_utc=now)
-        if not fixtures.empty and not history.empty:
+        fixtures_count=len(fixtures)
+        if fixtures.empty:
+            print('No pre-tip games remain today in the schedule feed.')
+        elif history.empty:
+            print(f'{fixtures_count} upcoming fixtures; history unavailable, '
+                  'so no safe matchup predictions generated.')
+        else:
             slate=analyze_slate(history,fixtures,local.date().isoformat(),season=season)
+            projections_count=int(pd.to_numeric(slate.get('Projected home margin'),errors='coerce').notna().sum())
+            # These match/quality checks mirror the actual snapshot requirements.
+            eligible_count=sum(
+                _number(r.get('Projected home margin')) is not None
+                and (_number(r.get('Match confidence')) or 0) >= .93
+                and _number(r.get('Home games')) is not None
+                and _number(r.get('Away games')) is not None
+                and _key(r.get('Matched home')) != _key(r.get('Matched away'))
+                and bool(_key(r.get('Matched home')))
+                and bool(_key(r.get('Matched away')))
+                for r in slate.to_dict('records')
+            )
             pred=snapshot_predictions(pred,fixtures,slate,now=now)
-    except Exception:
-        print("Today's fixture/projection snapshot unavailable; prior audit records preserved.")
-    # Add any flagged sportsbook quote, as an immutable *paper* watch.
-    watch=snapshot_watch(watch,Path(os.getenv('SCAN_OUTPUT','run_artifacts/quotes.csv')),pred)
+    except Exception as e:
+        print(f"Today's forecast snapshot unavailable ({type(e).__name__}); "
+              'prior audit records preserved. See full run logs for source status.')
+    # This phase is independent of the odds lookup. Odds are attached later.
     _write_csv(pred_path,pred,PRED_FIELDS)
     _write_csv(watch_path,watch,WATCH_FIELDS)
+    new_count=len(pred)-initial_pred
+    newly_graded=int((pred['status']=='GRADED').sum())-int(initial_graded)
+    status=(f'Scan audit: {fixtures_count} pre-tip fixtures, {projections_count} model '
+            f'estimates, {eligible_count} eligible estimates, {new_count} NEW frozen '
+            f'pregame predictions, {newly_graded} NEW results graded. '
+            f'Score data latest date: {score_date}.')
+    print(status)
+    location = os.getenv('GITHUB_STEP_SUMMARY','')
+    if location:
+        with open(location,'a',encoding='utf-8') as fd:
+            fd.write('\n' + status + '\n')
     report(pred,watch)
 
+
 if __name__=='__main__':
-    run()
+    import sys
+    if '--self-test' in sys.argv:
+        print(tracker_self_test())
+    else:
+        run(quotes_only='--quotes-only' in sys.argv)
