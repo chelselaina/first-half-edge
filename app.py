@@ -8,6 +8,7 @@ from agent.feeds import get_live_h1_odds, get_history
 from agent.model import train,scan
 from agent.demo import create_demo
 from agent.matchups import prepare_current_season, fit_current_ratings, team_summary, illustrative_matchup
+from agent.slate import fetch_upcoming_events, analyze_slate
 
 st.set_page_config(page_title='First Half Edge | NCAAB',page_icon='🏀',layout='wide')
 st.title('🏀 First Half Edge')
@@ -73,7 +74,7 @@ with st.sidebar:
 if st.session_state.get('demo'):
     st.error('FICTIONAL DEMONSTRATION DATA. THESE ARE NOT REAL TEAMS, ODDS, OR BETTING OPPORTUNITIES.')
 
-tab1,tab2,tab3,tab4=st.tabs(['Model validation','First-half scanner','How to use','2026–27 Matchups'])
+tab1,tab2,tab3,tab4,tab5=st.tabs(['Model validation','First-half scanner','How to use','2026–27 Matchups','Daily slate'])
 with tab1:
     st.subheader('Train and verify the model')
     if 'games' not in st.session_state:
@@ -205,3 +206,40 @@ with tab4:
                 st.caption('Possession-based pace, efficiency per possession, lineup changes and injuries are NOT available in the uploaded halftime-score CSV; total points are not a valid replacement for pace. Those require play-by-play/box-score or roster feeds.')
         except Exception as exc:
             st.error(f'Current-season analysis could not run: {exc}')
+
+
+with tab5:
+    st.subheader('Daily NCAA matchup scanner')
+    st.caption('One-click schedule lookup and research estimates for real upcoming games. Uses The Odds API events listing (no betting prices and no quota-counted odds calls).')
+    st.warning('EXPERIMENTAL RESEARCH ONLY. This matchup estimator has not been validated against sportsbook lines. No bet recommendations or win probabilities are issued here.')
+    if 'games' not in st.session_state or st.session_state.get('demo',True):
+        st.info('Use the sidebar to load real history including the 2027 season before scanning.')
+    else:
+        st.caption('For any selected date, estimates use ONLY completed 2026–27 games before that date. No previous-season team stats are carried forward.')
+        if st.button('Scan scheduled games for selected date',type='primary',disabled=not bool(api_key)):
+            try:
+                with st.spinner('Reading upcoming NCAA games and comparing this-season teams…'):
+                    slate=fetch_upcoming_events(str(day),api_key)
+                    if slate.empty:
+                        st.session_state['slate_result']=pd.DataFrame()
+                    else:
+                        st.session_state['slate_result']=analyze_slate(st.session_state.games,slate,str(day))
+                    st.session_state['slate_day']=str(day)
+            except Exception as exc:
+                st.error(f'Daily scanner could not run: {exc}')
+        if not api_key:
+            st.info('Enter your private Odds API key in the left sidebar to load the upcoming schedule. Never add it to public GitHub.')
+        if st.session_state.get('slate_day')==str(day) and 'slate_result' in st.session_state:
+            r=st.session_state.slate_result
+            if r.empty:
+                st.info('No future events were returned for that Eastern date. No fixtures were invented.')
+            else:
+                st.metric('Scheduled games found',len(r))
+                st.metric('Experimental estimates displayed',int(r['Projected home margin'].notna().sum()))
+                st.dataframe(r,hide_index=True,use_container_width=True,
+                    column_config={'Match confidence':st.column_config.NumberColumn(format='%.1%')})
+                st.download_button('Download daily research CSV',r.to_csv(index=False),
+                    file_name=f'first_half_slate_{day}.csv',mime='text/csv')
+                st.caption('A matched school may be absent or have fewer than five games. Such rows are flagged or withheld. Schedule may omit games not listed by the provider. No pace/possession stats, injuries, market prices, or betting edge computed here.')
+        else:
+            st.caption('Select the desired Eastern game date in the left sidebar, then press Scan. If the provider lists no events, we show no games rather than inventing matchups.')
