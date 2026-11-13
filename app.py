@@ -26,7 +26,7 @@ with st.sidebar:
             st.session_state.pop(old_key,None)
     st.markdown('### Real NCAA game history')
     st.caption('Free public SportsDataverse results; downloads historical games with verified halftime scores. Available release dates can lag the current season.')
-    hist_seasons=st.multiselect('Historical seasons (ending year)',[2023,2024,2025,2026,2027],default=[2024,2025,2026],help='The 2026 season means 2025–26. The 2027 release may be delayed or not yet contain current games.')
+    hist_seasons=st.multiselect('Historical seasons (ending year)',[2023,2024,2025,2026,2027],default=[2027],key='history_seasons_v06',help='2027 means the current 2026–27 basketball season and is selected by default. Add past seasons only when you specifically want historical validation. Current-season matchup projections still use 2027 only.')
     if st.button('Fetch REAL NCAA halftime history',disabled=not hist_seasons,use_container_width=True):
         try:
             with st.spinner('Downloading and checking season files; this may take a while…'):
@@ -59,8 +59,21 @@ with st.sidebar:
     st.divider()
     st.write('**Optional live odds**')
     day=st.date_input('Eastern game date')
-    api_key=st.text_input('The Odds API key',type='password',value=os.environ.get('ODDS_API_KEY',''))
-    max_events=st.slider('Max games to query (API usage)',1,50,12)
+    # Keep credentials out of the GitHub repository and out of widget state.
+    # Streamlit Community Cloud secrets must contain ODDS_API_KEY = "...".
+    # A missing secrets.toml raises FileNotFoundError when st.secrets is accessed.
+    try:
+        stored_key = str(st.secrets.get('ODDS_API_KEY', '') or '').strip()
+    except (FileNotFoundError, KeyError, AttributeError):
+        stored_key = ''
+    stored_key = stored_key or os.environ.get('ODDS_API_KEY', '').strip()
+    if stored_key:
+        st.caption('✓ Odds API connected using a saved key from app settings. No need to enter it again.')
+        api_key = stored_key
+    else:
+        api_key=st.text_input('The Odds API key (temporary; save it in Streamlit Secrets)',type='password')
+        st.caption('To save it permanently, open Streamlit Community Cloud → your app → Settings → Secrets. Never commit the key to public GitHub.')
+    max_events=st.slider('Max games to query (API usage)',1,50,3)
     st.caption('Fetching a first-half market makes one paid/quota-counted event request per game. Choose a small cap.')
     if st.button('Fetch first-half lines',disabled=not bool(api_key),use_container_width=True):
         with st.spinner('Loading live first-half lines…'):
