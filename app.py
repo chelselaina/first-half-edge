@@ -75,6 +75,105 @@ if st.session_state.get('demo'):
     st.error('FICTIONAL DEMONSTRATION DATA. THESE ARE NOT REAL TEAMS, ODDS, OR BETTING OPPORTUNITIES.')
 
 tab1,tab2,tab3,tab4,tab5=st.tabs(['Model validation','First-half scanner','How to use','2026–27 Matchups','Daily slate'])
+
+# ---------------------------------------------------------------------------
+# v0.4: readable, portrait-friendly Daily Slate cards.
+# This layer changes presentation only. It does NOT validate a betting model.
+# ---------------------------------------------------------------------------
+def _as_num(value):
+    number = pd.to_numeric(value, errors='coerce')
+    return float(number) if pd.notna(number) else None
+
+
+def _daily_slate_cards(result: pd.DataFrame, quoted: pd.DataFrame | None, target_day: str):
+    """Render game-by-game research cards, never a horizontally scrolling slate."""
+    show = st.radio('Games to show', ['All games', 'With projections', 'Needs review'],
+                    horizontal=True, key='slate_card_filter')
+    sort_option = st.selectbox('Sort games by',
+                               ['Scheduled tip time', 'Largest projected halftime lead'],
+                               key='slate_card_sort')
+    view=result.copy()
+    view['__margin']=pd.to_numeric(view['Projected home margin'], errors='coerce')
+    if show=='With projections':
+        view=view[view['__margin'].notna()].copy()
+    elif show=='Needs review':
+        view=view[(view['__margin'].isna()) |
+                  (view['Status'].fillna('').str.contains('SMALL SAMPLE|NO ESTIMATE',case=False,regex=True))].copy()
+    if sort_option=='Largest projected halftime lead':
+        view['__abs_margin']=view['__margin'].abs().fillna(-1.0)
+        view=view.sort_values('__abs_margin', ascending=False, kind='stable')
+    # Scheduled tip order is the original order provided by the event feed.
+    count=len(view)
+    st.caption(f'{count} matchups shown. Margins describe expected halftime leads, not betting edges.')
+    if not count:
+        st.info('Nothing matched that filter.')
+        return
+    pages=(count+9)//10
+    page=st.selectbox('Page', list(range(1,pages+1)),
+                      format_func=lambda p:f'{p} of {pages}', key='slate_card_page')
+    selected=view.iloc[(page-1)*10:page*10]
+    q=quoted if isinstance(quoted,pd.DataFrame) else pd.DataFrame()
+    has_quotes=not q.empty and {'event_id','game_date','bookmaker','selection','point','price'}.issubset(q.columns)
+    for row in selected.to_dict('records'):
+        game=str(row['Game (away @ home)'])
+        if ' @ ' in game:
+            away,home=game.rsplit(' @ ',1)
+        else:
+            away,home='Away team','Home team'
+        margin=_as_num(row.get('Projected home margin'))
+        n_home=_as_num(row.get('Home games'))
+        n_away=_as_num(row.get('Away games'))
+        low_sample=(n_home is None or n_away is None or min(n_home,n_away)<5)
+        with st.container(border=True):
+            st.markdown(f'#### {away} @ {home}')
+            st.caption(f"Tip: {row.get('Tip (ET)','Time unavailable')} Eastern · Research only")
+            if margin is None:
+                st.warning('NO ESTIMATE — Team data or matching needs verification.')
+                st.markdown('**Bet decision: NO BET**')
+                with st.expander('Why no estimate?'):
+                    st.write(str(row.get('Status','Insufficient information')))
+                continue
+            hp=_as_num(row.get('Home 1H projected'))
+            ap=_as_num(row.get('Away 1H projected'))
+            left,right=st.columns(2)
+            with left:
+                st.metric('Home 1H projection',f'{hp:.1f}' if hp is not None else '—')
+                st.caption(home)
+            with right:
+                st.metric('Away 1H projection',f'{ap:.1f}' if ap is not None else '—')
+                st.caption(away)
+            leader=home if margin>=0 else away
+            st.markdown(f'**Projected halftime leader: {leader}, by {abs(margin):.1f} pts**')
+            if low_sample:
+                st.caption(f"Low confidence · Games played: {home} {int(n_home) if n_home is not None else '—'}; {away} {int(n_away) if n_away is not None else '—'}." )
+            else:
+                st.caption('Research projection only; no independently validated cover probability.')
+            event_quotes=pd.DataFrame()
+            if has_quotes:
+                try:
+                    event_quotes=q[(q['event_id'].astype(str)==str(row['Event ID'])) &
+                                   (q['game_date'].astype(str)==str(target_day))].copy()
+                except (KeyError, ValueError):
+                    event_quotes=pd.DataFrame()
+            if event_quotes.empty:
+                st.caption('Sportsbook 1H spread: not available for this game in the loaded quotes.')
+            else:
+                st.markdown('**Available first-half quotes**')
+                # Display book prices without inventing a best available line or bet.
+                event_quotes=event_quotes.drop_duplicates(['bookmaker','selection','point','price'])
+                for offer in event_quotes.head(6).to_dict('records'):
+                    p=_as_num(offer.get('point'))
+                    price=_as_num(offer.get('price'))
+                    if p is None or price is None: continue
+                    st.write(f"{offer.get('bookmaker','Book')}: {offer.get('selection','Team')} {p:+g} ({int(price):+d})")
+                st.caption('Quotes may become stale. Verify availability directly with the book.')
+            st.markdown('**Bet decision: NO BET — model/market edge not validated**')
+            with st.expander('See this season’s matchup stats'):
+                st.write(f"**{home}:** {row.get('Home 1H scored','—')} 1H scored; {row.get('Home 1H allowed','—')} allowed; {int(n_home) if n_home is not None else '—'} games.")
+                st.write(f"**{away}:** {row.get('Away 1H scored','—')} 1H scored; {row.get('Away 1H allowed','—')} allowed; {int(n_away) if n_away is not None else '—'} games.")
+                st.caption('Opponent-adjusted numbers are experimental point-based estimates; true possession pace, lineups and injuries are not yet connected.')
+
+
 with tab1:
     st.subheader('Train and verify the model')
     if 'games' not in st.session_state:
@@ -209,16 +308,16 @@ with tab4:
 
 
 with tab5:
-    st.subheader('Daily NCAA matchup scanner')
-    st.caption('One-click schedule lookup and research estimates for real upcoming games. Uses The Odds API events listing (no betting prices and no quota-counted odds calls).')
-    st.warning('EXPERIMENTAL RESEARCH ONLY. This matchup estimator has not been validated against sportsbook lines. No bet recommendations or win probabilities are issued here.')
+    st.subheader('Daily Slate Board')
+    st.caption('Each game at a glance. No sideways scrolling and no implied bets.')
+    st.warning('EXPERIMENTAL RESEARCH ONLY. A predicted halftime lead is NOT a verified betting edge. No confirmed betting recommendations are issued.')
     if 'games' not in st.session_state or st.session_state.get('demo',True):
-        st.info('Use the sidebar to load real history including the 2027 season before scanning.')
+        st.info('Load real 2026–27 history in the sidebar first, or upload your saved history CSV.')
     else:
-        st.caption('For any selected date, estimates use ONLY completed 2026–27 games before that date. No previous-season team stats are carried forward.')
+        st.caption('Uses only completed 2026–27 scores before the selected game date. It does not have verified possession pace, injuries, or player availability.')
         if st.button('Scan scheduled games for selected date',type='primary',disabled=not bool(api_key)):
             try:
-                with st.spinner('Reading upcoming NCAA games and comparing this-season teams…'):
+                with st.spinner('Reading NCAA fixtures and generating current-season research estimates…'):
                     slate=fetch_upcoming_events(str(day),api_key)
                     if slate.empty:
                         st.session_state['slate_result']=pd.DataFrame()
@@ -228,18 +327,20 @@ with tab5:
             except Exception as exc:
                 st.error(f'Daily scanner could not run: {exc}')
         if not api_key:
-            st.info('Enter your private Odds API key in the left sidebar to load the upcoming schedule. Never add it to public GitHub.')
+            st.info('Enter your private Odds API key in the sidebar to retrieve upcoming fixtures. Do not put it in public GitHub.')
         if st.session_state.get('slate_day')==str(day) and 'slate_result' in st.session_state:
             r=st.session_state.slate_result
             if r.empty:
-                st.info('No future events were returned for that Eastern date. No fixtures were invented.')
+                st.info('No future events found for that Eastern date. No games were invented.')
             else:
-                st.metric('Scheduled games found',len(r))
-                st.metric('Experimental estimates displayed',int(r['Projected home margin'].notna().sum()))
-                st.dataframe(r,hide_index=True,use_container_width=True,
-                    column_config={'Match confidence':st.column_config.NumberColumn(format='%.1%')})
-                st.download_button('Download daily research CSV',r.to_csv(index=False),
+                n=int(pd.to_numeric(r['Projected home margin'], errors='coerce').notna().sum())
+                c1,c2,c3=st.columns(3)
+                c1.metric('Games scheduled',len(r))
+                c2.metric('Model estimates',n)
+                c3.metric('Confirmed bets',0)
+                st.caption('NO BET is the default until odds are present and the model is validated against betting markets.')
+                _daily_slate_cards(r, st.session_state.get('lines'), str(day))
+                st.download_button('Export full slate CSV',r.to_csv(index=False),
                     file_name=f'first_half_slate_{day}.csv',mime='text/csv')
-                st.caption('A matched school may be absent or have fewer than five games. Such rows are flagged or withheld. Schedule may omit games not listed by the provider. No pace/possession stats, injuries, market prices, or betting edge computed here.')
         else:
-            st.caption('Select the desired Eastern game date in the left sidebar, then press Scan. If the provider lists no events, we show no games rather than inventing matchups.')
+            st.caption('Select an Eastern game date in the sidebar and tap Scan to load the slate.')
