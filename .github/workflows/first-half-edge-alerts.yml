@@ -7,7 +7,7 @@ on:
       timezone: 'America/New_York'
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 concurrency:
@@ -17,27 +17,51 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Check upcoming games and fresh 1H lines
+
+      - name: Check upcoming games and fresh first-half lines
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           SCAN_OUTPUT: run_artifacts/quotes.csv
         run: python -m agent.auto_alert
-      - name: Save paper research log
+
+      - name: Freeze and grade paper forecasts
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SCAN_OUTPUT: run_artifacts/quotes.csv
+        run: python -m agent.performance
+
+      - name: Preserve paper ledgers in repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/paper_predictions.csv data/paper_watch_candidates.csv
+          if ! git diff --cached --quiet; then
+            git commit -m "Save pregame paper forecasts and grades [skip ci]"
+            git push origin HEAD:main
+          else
+            echo "No new records or results to save."
+          fi
+
+      - name: Save scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: first-half-scan-${{ github.run_id }}
-          path: run_artifacts/quotes.csv
+          path: |
+            run_artifacts/quotes.csv
+            data/paper_predictions.csv
+            data/paper_watch_candidates.csv
           if-no-files-found: warn
           retention-days: 30
