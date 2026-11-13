@@ -1,7 +1,12 @@
 """Optional local Streamlit user interface. Start: streamlit run app.py"""
 from __future__ import annotations
 import io
+import html
 import os
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 from agent.feeds import get_live_h1_odds, get_history
@@ -87,7 +92,7 @@ with st.sidebar:
 if st.session_state.get('demo'):
     st.error('FICTIONAL DEMONSTRATION DATA. THESE ARE NOT REAL TEAMS, ODDS, OR BETTING OPPORTUNITIES.')
 
-tab1,tab2,tab3,tab4,tab5=st.tabs(['Model validation','First-half scanner','How to use','2026–27 Matchups','Daily slate'])
+tab6,tab1,tab2,tab3,tab4,tab5=st.tabs(['⚡ Live 1H Cushions','Model validation','First-half scanner','How to use','2026–27 Matchups','Daily slate'])
 
 # ---------------------------------------------------------------------------
 # v0.4: readable, portrait-friendly Daily Slate cards.
@@ -456,3 +461,352 @@ with tab5:
                     file_name=f'first_half_slate_{day}.csv',mime='text/csv')
         else:
             st.caption('Select an Eastern game date in the sidebar and tap Scan to load the slate.')
+
+
+# ---------------------------------------------------------------------------
+# v1.0: usable today, no added Odds API requests.
+# Load frozen forecasts from the public GitHub ledger (local fallback) and
+# compare them with MANUALLY ENTERED actual FIRST-HALF sportsbook spreads.
+# Prices/quotes entered by the visitor are not independently verified.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=120, show_spinner=False)
+def _fhe_get_frozen_ledger():
+    remote = ('https://raw.githubusercontent.com/chelselaina/'
+              'first-half-edge/main/data/paper_predictions.csv')
+    error = None
+    try:
+        request = Request(remote, headers={'User-Agent':'FirstHalfEdge-Research/1.0'})
+        with urlopen(request, timeout=8) as reply:
+            content=reply.read(1000000)
+        return pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False), 'Latest GitHub paper ledger'
+    except Exception as exc:
+        error = str(exc)
+    local = Path('data/paper_predictions.csv')
+    if local.exists():
+        return pd.read_csv(local, dtype=str, keep_default_na=False), 'Local deployed ledger (GitHub fetch failed)'
+    return pd.DataFrame(), f'Ledger unavailable: {error}'
+
+
+def _fhe_american_odds(value):
+    raw=str(value).strip().replace('−','-')
+    if not raw:
+        return None
+    try:
+        number=int(raw)
+    except (TypeError,ValueError):
+        return None
+    if number <= -100 or number >= 100:
+        return number
+    return None
+
+
+def _fhe_game_name(record):
+    return f"{record['provider_away']} at {record['provider_home']}"
+
+
+def _fhe_tip_eastern(value):
+    try:
+        return pd.Timestamp(value).tz_convert('America/New_York').strftime('%-I:%M %p ET')
+    except Exception:
+        return 'Unknown tip time'
+
+
+def _fhe_is_pregame(record):
+    try:
+        tip=pd.Timestamp(record['tip_utc'])
+        if tip.tzinfo is None:
+            tip=tip.tz_localize('UTC')
+        return tip > pd.Timestamp.now(tz='UTC')
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# v1.1: half-time scorecard presentation inspired by the user's supplied
+# sports-odds dashboard reference. Keeps the v1.0 manual-market method.
+# ---------------------------------------------------------------------------
+_FHE_CARD_STYLES = """
+<style>
+.fhe-score-card {
+  background: linear-gradient(130deg,#17283b 0%,#1d3347 100%);
+  color: #f5f9ff; border-radius: 17px; margin: 0.65rem 0 1rem;
+  border: 1px solid #354a60; overflow: hidden; box-shadow: 0 3px 10px rgba(0,0,0,.12);
+}
+.fhe-score-header { display:flex; align-items:center; justify-content:space-between;
+  gap:.4rem; padding:.75rem 1rem; background:#132335; flex-wrap:wrap; }
+.fhe-fixture {font-size: .97rem; font-weight:750; overflow-wrap:anywhere;}
+.fhe-tip {font-size: .78rem; color:#b8c8d8;}
+.fhe-score-heading {display:grid;grid-template-columns: minmax(0,1fr) 6.5rem 8rem;
+  gap:.3rem; padding:.5rem 1rem 0; color:#a7bacd;font-size:.72rem;}
+.fhe-score-row {display:grid;grid-template-columns: minmax(0,1fr) 6.5rem 8rem;
+  gap:.3rem;align-items:center;padding:.35rem 1rem;}
+.fhe-team {font-size: .97rem;font-weight:690; overflow-wrap:anywhere;}
+.fhe-team small {display:block;font-weight:400;color:#a9bbcb;font-size:.72rem;}
+.fhe-score {font-size:1.24rem;font-weight:790;text-align:center;
+  border-radius:8px;background:#f9fbfe;color:#1a2b3e;padding:.33rem .2rem;}
+.fhe-line {font-size:.96rem;text-align:center;font-weight:700;
+  border:1px solid #3a5267;border-radius:8px;padding:.44rem .1rem;}
+.fhe-line small {display:block;font-weight:450;color:#c4d0df;font-size:.72rem;}
+.fhe-line-adv {background:#2b5b4a;border-color:#40886b;}
+.fhe-score-footer {padding:.68rem 1rem .85rem;border-top:1px solid #3a4e62;
+  display:flex;gap:.5rem;justify-content:space-between;align-items:center;flex-wrap:wrap;}
+.fhe-tag {font-size:.73rem;letter-spacing:.025rem;font-weight:780;border-radius:99px;
+  padding:.32rem .6rem;background:#45576c;color:#fff;}
+.fhe-tag-review {background:#d5a12a;color:#102236;}
+.fhe-tag-provisional {background:#68532a;color:#fce8ae;}
+.fhe-claim {font-size:.82rem;color:#e3ebf2;}
+.fhe-small-note {padding:.15rem 1rem .8rem;color:#abbccc;font-size:.72rem;}
+@media(max-width:540px) {
+  .fhe-score-heading,.fhe-score-row {grid-template-columns:minmax(0,1fr) 4.7rem 6.7rem;}
+  .fhe-score-heading {font-size:.65rem;}
+  .fhe-score {font-size:1.05rem;}
+  .fhe-team {font-size:.87rem;}
+  .fhe-line {font-size:.83rem;}
+}
+</style>
+"""
+
+
+def _fhe_safe_text(value):
+    return html.escape(str(value),quote=True)
+
+
+def _fhe_score_text(value):
+    val=pd.to_numeric(value,errors='coerce')
+    return f'{float(val):.1f}' if pd.notna(val) else '—'
+
+
+def _fhe_scorecard(rec, q=None):
+    """Preview model HALF-TIME projections beside manually entered 1H spreads.
+
+    q is visitor-entered session data, NOT an independently verified market quote.
+    The output must never suggest a betting edge when the market is absent.
+    """
+    q=q or {}
+    home=str(rec.get('provider_home','Home'))
+    away=str(rec.get('provider_away','Away'))
+    margin=pd.to_numeric(rec.get('predicted_home_margin'),errors='coerce')
+    hscore=_fhe_score_text(rec.get('projected_home_h1'))
+    ascore=_fhe_score_text(rec.get('projected_away_h1'))
+    line=pd.to_numeric(q.get('home_spread'),errors='coerce')
+    quoted=pd.notna(line)
+    home_line=f'{float(line):+g}' if quoted else '—'
+    away_line=f'{-float(line):+g}' if quoted else '—'
+    ph=_fhe_american_odds(q.get('home_price',''))
+    pa=_fhe_american_odds(q.get('away_price',''))
+    home_price=f'{ph:+d}' if ph is not None else 'No price'
+    away_price=f'{pa:+d}' if pa is not None else 'No price'
+    pregame=_fhe_is_pregame(rec)
+    cushion=float(margin)+float(line) if quoted and pd.notna(margin) else None
+    cushion_abs=abs(cushion) if cushion is not None else None
+    side=home if cushion is not None and cushion >= 0 else away
+    selected_price=ph if cushion is not None and cushion >= 0 else pa
+    if not quoted:
+        pill='NO 1H LINE ENTERED'; pill_class=''
+        claim='Model score projection only · compare with an actual first-half spread'
+    elif not pregame:
+        pill='ALREADY STARTED / FINAL';pill_class=''
+        claim='Saved line is for review only; do not treat as a new pregame opportunity'
+    elif cushion_abs is not None and cushion_abs < 2.5:
+        pill='NO 2.5+ POINT GAP';pill_class=''
+        claim=f'{side}: {cushion_abs:.1f}-point model/market difference · pass threshold'
+    elif not str(q.get('book','')).strip() or selected_price is None:
+        pill='UNVERIFIED GAP';pill_class='fhe-tag-provisional'
+        claim=f'{side}: {cushion_abs:.1f}-point projected cushion · add book and odds'
+    elif selected_price < -120:
+        pill='PRICE ABOVE LIMIT';pill_class='fhe-tag-provisional'
+        claim=f'{side}: {cushion_abs:.1f}-point projection gap · price {selected_price:+d} worse than -120'
+    else:
+        pill='RESEARCH WATCH';pill_class='fhe-tag-review'
+        claim=f'{side}: {cushion_abs:.1f}-point projected cushion · manually entered price; recheck at book'
+    h_adv=' fhe-line-adv' if quoted and cushion is not None and cushion>=2.5 and pregame else ''
+    a_adv=' fhe-line-adv' if quoted and cushion is not None and cushion<=-2.5 and pregame else ''
+    book=_fhe_safe_text(str(q.get('book','')).strip() or 'Book not entered') if quoted else 'No sportsbook quote'
+    tip=_fhe_safe_text(_fhe_tip_eastern(rec.get('tip_utc','')))
+    forecast_stamp=_fhe_safe_text(str(rec.get('forecast_utc','Unknown')))
+    home_n=_fhe_safe_text(rec.get('home_games','?'))
+    away_n=_fhe_safe_text(rec.get('away_games','?'))
+    return f"""<div class="fhe-score-card">
+      <div class="fhe-score-header">
+        <div class="fhe-fixture">{_fhe_safe_text(away)} @ {_fhe_safe_text(home)}</div>
+        <div class="fhe-tip">{tip} · 1st HALF</div>
+      </div>
+      <div class="fhe-score-heading"><span>TEAM</span><span style="text-align:center">PROJECTED 1H</span><span style="text-align:center">1H SPREAD</span></div>
+      <div class="fhe-score-row">
+        <span class="fhe-team">{_fhe_safe_text(away)}<small>Away</small></span>
+        <span class="fhe-score">{ascore}</span>
+        <span class="fhe-line{a_adv}">{away_line}<small>{away_price}</small></span>
+      </div>
+      <div class="fhe-score-row">
+        <span class="fhe-team">{_fhe_safe_text(home)}<small>Home</small></span>
+        <span class="fhe-score">{hscore}</span>
+        <span class="fhe-line{h_adv}">{home_line}<small>{home_price}</small></span>
+      </div>
+      <div class="fhe-score-footer">
+        <span class="fhe-tag {pill_class}">{_fhe_safe_text(pill)}</span>
+        <span class="fhe-claim">{_fhe_safe_text(claim)}</span>
+      </div>
+      <div class="fhe-small-note">{book} · Current-season sample: {home_n} home / {away_n} away games · Saved forecast UTC {forecast_stamp}</div>
+    </div>"""
+
+
+with tab6:
+    st.markdown(_FHE_CARD_STYLES,unsafe_allow_html=True)
+    st.subheader('🏀 First-Half Scoreboard & Cushion Checker')
+    st.caption('Uses your frozen First Half Edge model projections, NOT an outside model. '
+               'Manually enter an actual FIRST-HALF spread and price from your sportsbook. '
+               'No extra odds-API calls, no bets placed.')
+    st.warning('EXPERIMENTAL RESEARCH ONLY: a point gap is not a proven betting edge. '
+               'This early-season model is based on very few games and has not shown '
+               'profitable results. Check team injuries, pricing, and whether the market '
+               'is specifically FIRST HALF. Never use a full-game spread here.')
+    if st.button('Refresh frozen predictions', key='fhe_refresh_ledger'):
+        _fhe_get_frozen_ledger.clear()
+    ledger, ledger_source = _fhe_get_frozen_ledger()
+    st.caption(f'Prediction source: {ledger_source}')
+    required={'event_id','game_date','tip_utc','provider_home','provider_away',
+              'predicted_home_margin','home_games','away_games','status','forecast_utc'}
+    if ledger.empty or not required.issubset(ledger.columns):
+        st.error('No usable saved forecast file found. Confirm data/paper_predictions.csv '
+                 'exists in your repository, then reload the dashboard.')
+    else:
+        ledger=ledger.copy()
+        ledger['predicted_home_margin']=pd.to_numeric(ledger['predicted_home_margin'], errors='coerce')
+        ledger=ledger.dropna(subset=['predicted_home_margin'])
+        dates=sorted(ledger['game_date'].dropna().astype(str).unique().tolist(), reverse=True)
+        today=datetime.now(ZoneInfo('America/New_York')).date().isoformat()
+        chosen_day=st.selectbox('Game date (Eastern)', dates,
+                     index=dates.index(today) if today in dates else 0, key='fhe_market_date')
+        slate=ledger[ledger['game_date']==chosen_day].sort_values('tip_utc').copy()
+        slate=slate.drop_duplicates(subset=['event_id'])
+        remain=sum(_fhe_is_pregame(r) for r in slate.to_dict('records'))
+        c1,c2,c3=st.columns(3)
+        c1.metric('Saved model forecasts',len(slate))
+        c2.metric('Not yet tipped off',remain)
+        c3.metric('Model picks verified as profitable',0)
+        st.caption('The 41 saved projections are not necessarily every game on today’s schedule. '
+                   'Games without valid team matching or sufficient sample may be excluded.')
+        if 'fhe_saved_quotes_v1' not in st.session_state:
+            st.session_state['fhe_saved_quotes_v1']={}
+        quotes=st.session_state['fhe_saved_quotes_v1']
+        games=slate.to_dict('records')
+        labels={str(g['event_id']): f"{_fhe_tip_eastern(g['tip_utc'])} · {_fhe_game_name(g)}"
+                for g in games}
+        selected=st.selectbox('Select a game to compare',list(labels.keys()),
+                              format_func=lambda item: labels[item],key='fhe_game_picker')
+        row=next(g for g in games if str(g['event_id'])==selected)
+        pred=float(row['predicted_home_margin'])
+        home=row['provider_home']
+        away=row['provider_away']
+        st.caption('Select a matchup to see the projected halftime scores and compare an actual sportsbook line:')
+        st.markdown(_fhe_scorecard(row,quotes.get(selected)),unsafe_allow_html=True)
+        st.metric(f'Model projected {home} first-half margin',f'{pred:+.1f} pts')
+        st.caption(f"Frozen forecast: {row['forecast_utc']} UTC · "
+                   f"Current-season sample: {row['home_games']} home-team games, "
+                   f"{row['away_games']} away-team games. "
+                   'Match confidence measures team-name matching, not predicted accuracy.')
+        current=quotes.get(selected,{})
+        with st.form(key=f'fhe_quote_form_{selected}',clear_on_submit=False):
+            spread=st.text_input(f'{home} FIRST-HALF spread',
+                   value=str(current.get('home_spread','')),
+                   placeholder='Example: -6.5 or +2.5')
+            col_a,col_b=st.columns(2)
+            with col_a:
+                price_h=st.text_input(f'{home} price',
+                   value=str(current.get('home_price','')),
+                   placeholder='-110')
+            with col_b:
+                price_a=st.text_input(f'{away} price',
+                   value=str(current.get('away_price','')),
+                   placeholder='-110')
+            book=st.text_input('Sportsbook name',
+                  value=str(current.get('book','')),placeholder='e.g. DraftKings')
+            submitted=st.form_submit_button('Save / compare this first-half line',type='primary')
+        if submitted:
+            try:
+                value=float(spread.strip().replace('−','-'))
+                if not (-60 <= value <= 60):
+                    raise ValueError('spread is out of range')
+                if price_h.strip() and _fhe_american_odds(price_h) is None:
+                    raise ValueError('Invalid home-team American odds')
+                if price_a.strip() and _fhe_american_odds(price_a) is None:
+                    raise ValueError('Invalid away-team American odds')
+                quotes[selected]={'home_spread':value,'home_price':price_h.strip(),
+                                  'away_price':price_a.strip(),'book':book.strip(),
+                                  'entered_at':datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %I:%M %p ET')}
+                st.success('Line compared and added to today’s ranked watchlist below.')
+            except (ValueError,TypeError) as exc:
+                st.error(f'Enter the signed 1H spread (e.g. -6.5 or +2.5). {exc}')
+        saved=quotes.get(selected)
+        if saved:
+            margin_gap=pred+float(saved['home_spread'])
+            favored=home if margin_gap>=0 else away
+            favored_spread=float(saved['home_spread']) if margin_gap>=0 else -float(saved['home_spread'])
+            cushion=abs(margin_gap)
+            chosen_price=saved['home_price'] if margin_gap>=0 else saved['away_price']
+            c1,c2=st.columns(2)
+            c1.metric(f'Largest model cushion: {favored}',f'{cushion:.1f} pts')
+            c2.metric('Side at entered line',f'{favored} {favored_spread:+g}')
+            if not _fhe_is_pregame(row):
+                st.error('This game is already underway or complete. Do not treat this as a pregame opportunity.')
+            elif cushion < 2.5:
+                st.info('PASS: projected cushion is under the 2.5-point research threshold.')
+            elif not saved['book'] or not chosen_price:
+                st.warning('Provisional cushion only. Enter the named book and the price for the selected side.')
+            elif _fhe_american_odds(chosen_price)<-120:
+                st.warning('Large projected cushion, but the manually entered price is worse than -120.')
+            else:
+                st.warning('RESEARCH CANDIDATE: projected gap meets 2.5 points at the '
+                           'manually entered price. This is NOT a verified profitable edge '
+                           'or a betting recommendation. Independently confirm the quote.')
+        st.divider()
+        st.markdown('#### Your biggest manually entered first-half gaps')
+        found=[]
+        lookup={str(g['event_id']):g for g in games}
+        for eid,q in quotes.items():
+            if eid not in lookup:
+                continue
+            rr=lookup[eid]
+            hg=float(rr['predicted_home_margin'])+float(q['home_spread'])
+            is_home=hg>=0
+            selected_team=rr['provider_home'] if is_home else rr['provider_away']
+            selection_spread=float(q['home_spread'])*(1 if is_home else -1)
+            p=q['home_price'] if is_home else q['away_price']
+            found.append({'Game':_fhe_game_name(rr),'Tip ET':_fhe_tip_eastern(rr['tip_utc']),
+                 'Side':f'{selected_team} {selection_spread:+g}',
+                 'Model cushion':round(abs(hg),1),
+                 'Book':q['book'] or 'Not entered','Price':p or 'Not entered',
+                 'Pregame?': 'Yes' if _fhe_is_pregame(rr) else 'No',
+                 'Quote entered ET':q.get('entered_at','')})
+        if found:
+            board=pd.DataFrame(found).sort_values('Model cushion',ascending=False)
+            st.dataframe(board,hide_index=True,use_container_width=True)
+            st.download_button('Save your comparison list as CSV',
+                data=board.to_csv(index=False).encode('utf-8'),
+                file_name=f'first_half_manual_cushions_{chosen_day}.csv',mime='text/csv')
+        else:
+            st.info('No first-half lines entered for this date yet. Choose a game above '
+                    'and enter its 1H spread and price to see a ranked comparison.')
+        st.caption('Manually entered lines remain in this browser session only. Download the '
+                   'CSV if you want to keep your comparisons. They are NOT imported into '
+                   'the audited paper-betting performance ledger.')
+        st.divider()
+        st.markdown('### First-half projected scorecards — full saved slate')
+        st.caption('A match shows projected halftime scores even without a book quote. Highlighted '
+                   'green line cells show sizable MODEL/MARKET differences, not validated bets. '
+                   'Prices are manually entered and must be checked at your sportsbook.')
+        include_all=st.checkbox('Show games already tipped off',value=False,key='fhe_show_finished_cards_v11')
+        candidates=[g for g in games if include_all or _fhe_is_pregame(g)]
+        candidates=sorted(candidates,key=lambda r:str(r.get('tip_utc','')))
+        st.caption(f'{len(candidates)} forecasted matchups in this view; '
+                   'this is NOT necessarily every D-I game scheduled today.')
+        if not candidates:
+            st.info('No unstarted model-forecasted games left. Enable finished games to review the saved forecasts.')
+        else:
+            count_pages=(len(candidates)+7)//8
+            page=st.selectbox('Scorecard page',range(1,count_pages+1),
+                format_func=lambda i:f'Page {i} of {count_pages}',key='fhe_scorecard_page_v11')
+            for game_card in candidates[(page-1)*8:page*8]:
+                eid=str(game_card.get('event_id',''))
+                st.markdown(_fhe_scorecard(game_card,quotes.get(eid)),unsafe_allow_html=True)
+
