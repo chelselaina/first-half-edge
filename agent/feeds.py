@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -21,44 +22,60 @@ def _bool(x: Any) -> bool:
 
 
 def _period_points(blob: Any) -> list[int]:
-    """Parse score-by-period arrays, including CSV-serialized lists from hoopR.
+    """Decode per-period NCAA scores from JSON, Python, or numeric delimited text.
 
-    Refuse ambiguous or malformed scores instead of silently creating fake halves.
+    The SportsDataverse CSV documentation describes linescores as delimited text;
+    old versions of this app only accepted bracketed arrays and excluded every
+    otherwise-valid game in some releases. Never infer a score from a game total.
     """
     if blob is None or (isinstance(blob, float) and pd.isna(blob)):
         return []
     if isinstance(blob, (list, tuple)):
         parts = list(blob)
     else:
-        s = str(blob).strip()
-        if not s or s in {'nan', 'null', '[]'}:
+        raw = str(blob).strip()
+        if not raw or raw.lower() in {'nan', 'null', 'none', '[]'}:
             return []
-        try:
-            parts = json.loads(s)
-        except (ValueError, TypeError):
+        parts = None
+        for decoder in (json.loads, ast.literal_eval):
             try:
-                parts = ast.literal_eval(s)
-            except (ValueError, SyntaxError):
+                candidate = decoder(raw)
+                if isinstance(candidate, (list, tuple)):
+                    parts = list(candidate)
+                    break
+                if isinstance(candidate, dict):
+                    candidate = candidate.get('linescores', candidate.get('periods'))
+                    if isinstance(candidate, (list, tuple)):
+                        parts = list(candidate)
+                        break
+            except (ValueError, TypeError, SyntaxError):
+                pass
+        if parts is None:
+            # Examples: "38,41", "38|41", "[38 41]", "c(38, 41)".
+            # Accept ONLY all-numeric delimited strings, not game-score prose.
+            text = raw
+            if text.startswith('c(') and text.endswith(')'):
+                text = text[2:-1].strip()
+            if len(text) >= 2 and text[0] in '[({' and text[-1] in '])}':
+                text = text[1:-1].strip()
+            if not re.fullmatch(r'\d+(?:\s*[,;|/]\s*|\s+)\d+(?:(?:\s*[,;|/]\s*|\s+)\d+)*', text):
                 return []
-        if isinstance(parts, str):
-            try:
-                parts = json.loads(parts)
-            except (ValueError, TypeError):
-                return []
-    if not isinstance(parts, (list, tuple)):
-        return []
+            parts = re.split(r'\s*[,;|/]\s*|\s+', text)
     vals = []
     for item in parts:
         if isinstance(item, dict):
-            item = next((item.get(k) for k in ('value', 'score', 'displayValue', 'display_value') if item.get(k) is not None), None)
+            item = next((item.get(k) for k in
+                ('value', 'score', 'displayValue', 'display_value')
+                if item.get(k) is not None), None)
         try:
-            val = float(item)
-            if not val.is_integer() or val < 0 or val > 120:
+            value = float(item)
+            if not value.is_integer() or value < 0 or value > 120:
                 return []
-            vals.append(int(val))
+            vals.append(int(value))
         except (TypeError, ValueError):
             return []
-    return vals if len(vals) >= 2 else []
+    # A regulation NCAA men's game has two halves, plus possible overtime periods.
+    return vals if 2 <= len(vals) <= 6 else []
 
 
 def normalize_schedule(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -121,7 +138,10 @@ def get_history(seasons: list[int], destination: str, timeout: int = 60) -> pd.D
             raw = pd.read_csv(BytesIO(response.content), low_memory=False)
             clean, skipped = normalize_schedule(raw)
             if clean.empty:
-                raise ValueError('No completed, verified first-half games; check score serialization')
+                samples = raw[['home_linescores','away_linescores','home_score','away_score']].dropna().head(3).to_dict('records')
+                raise ValueError(
+                    f'No completed, verified first-half games. Rejection counts: {skipped}. '
+                    f'Sample source score formats: {str(samples)[:700]}')
             print(f'{year}: {len(clean):,} verified first-half games; excluded: {skipped}')
             frames.append(clean)
         except Exception as e:
