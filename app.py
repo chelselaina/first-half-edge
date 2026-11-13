@@ -7,6 +7,7 @@ import streamlit as st
 from agent.feeds import get_live_h1_odds, get_history
 from agent.model import train,scan
 from agent.demo import create_demo
+from agent.matchups import prepare_current_season, fit_current_ratings, team_summary, illustrative_matchup
 
 st.set_page_config(page_title='First Half Edge | NCAAB',page_icon='🏀',layout='wide')
 st.title('🏀 First Half Edge')
@@ -72,7 +73,7 @@ with st.sidebar:
 if st.session_state.get('demo'):
     st.error('FICTIONAL DEMONSTRATION DATA. THESE ARE NOT REAL TEAMS, ODDS, OR BETTING OPPORTUNITIES.')
 
-tab1,tab2,tab3=st.tabs(['Model validation','First-half scanner','How to use'])
+tab1,tab2,tab3,tab4=st.tabs(['Model validation','First-half scanner','How to use','2026–27 Matchups'])
 with tab1:
     st.subheader('Train and verify the model')
     if 'games' not in st.session_state:
@@ -142,3 +143,65 @@ The signed `point` is from the selected team's perspective (e.g., -4.5 for a fav
 
 See `README.md` for more details, sources, assumptions, and limitations.
 ''')
+
+with tab4:
+    st.subheader('Current-season matchup analyzer')
+    st.caption('Uses ONLY the 2026–27 season for team scoring and opponent-adjusted strength. No prior-year team scoring is carried forward.')
+    if 'games' not in st.session_state:
+        st.info('First load real NCAA history from the sidebar, selecting the 2027 season.')
+    elif st.session_state.get('demo',False):
+        st.warning('Fictional history is loaded. Fetch real 2027-season game results first.')
+    else:
+        try:
+            current = prepare_current_season(st.session_state.games, season=2027)
+            if current.empty:
+                st.warning('The loaded CSV does not contain games from the 2026–27 season. Re-fetch or upload the 2027 season.')
+            else:
+                ratings, rating_info = fit_current_ratings(current)
+                st.success(f"2026–27 season: {rating_info['completed_games']:,} completed games through {rating_info['through_date']}; {rating_info['teams']} teams.")
+                st.caption('Adjusted strengths use current-season first-half scoring against each team’s actual opponents, shrunk toward the current league average to limit 1–3 game overreaction.')
+                lookup=dict(zip(ratings.team_id,ratings.team))
+                team_options=sorted(lookup,key=lambda t: lookup[t].lower())
+                left,right=st.columns(2)
+                with left:
+                    home_id=st.selectbox('First team (treated as home)',team_options,format_func=lambda x:lookup[x],index=0,key='current_match_home')
+                with right:
+                    candidate_away=[t for t in team_options if t != home_id]
+                    away_id=st.selectbox('Second team (treated as away)',candidate_away,format_func=lambda x:lookup[x],index=0,key='current_match_away')
+                neutral=st.checkbox('Neutral-site game',value=False,key='current_match_neutral')
+                h=team_summary(home_id,current,ratings)
+                a=team_summary(away_id,current,ratings)
+                st.markdown('#### How these teams have performed this season')
+                overview=pd.DataFrame([
+                    {'Team':h['team'],'Games':h['games'],'1H scored':h['scored'],'1H allowed':h['allowed'],
+                     'Last 5 scored':h['recent_scored'],'Last 5 allowed':h['recent_allowed'],
+                     'Adj offense vs opponents':h['offense_adj'],'Adj defensive suppression':h['defense_adj'],
+                     'Opponents’ offensive strength':h['opponent_off_strength'],'Opponents’ defensive strength':h['opponent_def_strength']},
+                    {'Team':a['team'],'Games':a['games'],'1H scored':a['scored'],'1H allowed':a['allowed'],
+                     'Last 5 scored':a['recent_scored'],'Last 5 allowed':a['recent_allowed'],
+                     'Adj offense vs opponents':a['offense_adj'],'Adj defensive suppression':a['defense_adj'],
+                     'Opponents’ offensive strength':a['opponent_off_strength'],'Opponents’ defensive strength':a['opponent_def_strength']},
+                ])
+                st.dataframe(overview,hide_index=True,use_container_width=True,
+                  column_config={c:st.column_config.NumberColumn(format='%.1f') for c in overview.columns if c not in ('Team','Games')})
+                st.caption('Adjusted values are POINTS above/below the 2026–27 league scoring average, not possessions or official KenPom ratings. Positive defensive suppression is better.')
+                st.markdown('#### Recent opponents and first-half scores')
+                col_h,col_a=st.columns(2)
+                with col_h:
+                    st.write(f"**{h['team']}**")
+                    st.dataframe(h['schedule'].head(5).assign(date=lambda d:d.date.dt.strftime('%b %d')).rename(columns={'date':'Date','opponent':'Opponent','venue':'Site','pf':'Scored','pa':'Allowed'}),hide_index=True,use_container_width=True)
+                with col_a:
+                    st.write(f"**{a['team']}**")
+                    st.dataframe(a['schedule'].head(5).assign(date=lambda d:d.date.dt.strftime('%b %d')).rename(columns={'date':'Date','opponent':'Opponent','venue':'Site','pf':'Scored','pa':'Allowed'}),hide_index=True,use_container_width=True)
+                st.markdown('#### Experimental matchup estimate')
+                projected=illustrative_matchup(h,a,rating_info,neutral=neutral)
+                x,y,z=st.columns(3)
+                x.metric(f"{h['team']} 1H pts",f"{projected['home_points']:.1f}")
+                y.metric(f"{a['team']} 1H pts",f"{projected['away_points']:.1f}")
+                z.metric('First-team halftime margin',f"{projected['home_margin']:+.1f}")
+                if projected['min_games']<5:
+                    st.warning('SMALL SAMPLE: at least one team has fewer than five games this season. Treat this estimate as highly uncertain.')
+                st.error('RESEARCH ONLY — NOT A BET. This matchup estimator has not been separately backtested or calibrated against first-half sportsbook lines. Do not interpret the projected margin as a proven betting edge.')
+                st.caption('Possession-based pace, efficiency per possession, lineup changes and injuries are NOT available in the uploaded halftime-score CSV; total points are not a valid replacement for pace. Those require play-by-play/box-score or roster feeds.')
+        except Exception as exc:
+            st.error(f'Current-season analysis could not run: {exc}')
